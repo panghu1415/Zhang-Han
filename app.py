@@ -10,13 +10,9 @@ import plotly.express as px
 from typing import List, Dict, Any, Optional, Callable
 import concurrent.futures
 from io import BytesIO
-import numpy as np  # ✅ 单独引入 numpy
 
 # ================== 允许的测试用例类型 ==================
 ALLOWED_TYPES = ["正向", "异常", "边界", "安全", "性能", "界面", "其他"]
-
-# 每个功能点最多带入多少字符的上下文，防止 PRD 很长时每次都塞整篇
-MAX_CONTEXT_CHARS = 2000
 
 # ================== MarkMap 思维导图（可选） ==================
 try:
@@ -25,35 +21,20 @@ try:
 except ImportError:
     HAS_MARKMAP = False
 
-# ================== 页面基础配置（⚠ 必须是第一个 st.* 调用） ==================
-st.set_page_config(
-    page_title="智测 AI Pro - 需求转用例工作台（强化版）",
-    page_icon="🧬",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# ================== 语义相似度 Embedding（可选，使用缓存） ==================
-@st.cache_resource
-def load_embedding_model():
-    """
-    只在第一次调用时加载 SentenceTransformer，后面都走缓存。
-    """
-    try:
-        from sentence_transformers import SentenceTransformer
-        return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-    except Exception:
-        return None
-
-EMBED_MODEL = load_embedding_model()
-HAS_EMBED = EMBED_MODEL is not None
-
 # ================== JSON Repair（可选） ==================
 try:
     from json_repair import repair_json
     HAS_JSON_REPAIR = True
 except Exception:
     HAS_JSON_REPAIR = False
+
+# ================== 页面基础配置 ==================
+st.set_page_config(
+    page_title="智测 AI Pro - 需求转用例工作台（强化版）",
+    page_icon="🧬",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 # ================== 通用工具函数 ==================
 
@@ -83,15 +64,13 @@ def clean_and_parse_json(text: str) -> Any:
         except Exception:
             pass
 
-    # 3. ```json ... ```
+    # 3. ```json ... ``` 包裹
     match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
     if match:
         snippet = match.group(1)
-        # 先试直接 load
         try:
             return json.loads(snippet)
         except Exception:
-            # 再尝试 repair
             if HAS_JSON_REPAIR:
                 try:
                     repaired = repair_json(snippet)
@@ -119,9 +98,9 @@ def clean_and_parse_json(text: str) -> Any:
 
 def get_feishu_content(url: str, app_id: str, app_secret: str) -> str:
     """
-    飞书文档解析：
+    飞书文档解析（简化版）：
     - 未配置 app_id / secret 时：返回 Mock PRD 内容，保证 Demo 不翻车
-    - 配置后：尝试调用飞书 API（简化版）
+    - 配置后：尝试调用飞书 API（只做基础处理）
     - 对 Table Block 尝试转换为 Markdown 表格
     """
     if not url:
@@ -185,7 +164,6 @@ def get_feishu_content(url: str, app_id: str, app_secret: str) -> str:
                 md_rows = []
                 try:
                     for r in rows:
-                        # 不同版本结构可能不一样，这里做尽量“防御式”的解析
                         cells = r.get("cells") if isinstance(r, dict) else r
                         row_texts = []
                         for cell in cells:
@@ -195,7 +173,6 @@ def get_feishu_content(url: str, app_id: str, app_secret: str) -> str:
                             row_texts.append(cell_text.strip() or " ")
                         md_rows.append("| " + " | ".join(row_texts) + " |")
                     if md_rows:
-                        # 简单加 header 分割线
                         if len(md_rows) >= 2:
                             col_num = md_rows[0].count("|") - 1
                             sep = "| " + " | ".join(["---"] * col_num) + " |"
@@ -205,7 +182,6 @@ def get_feishu_content(url: str, app_id: str, app_secret: str) -> str:
                         else:
                             full_text_lines.extend(md_rows)
                 except Exception:
-                    # 如果表格解析失败，不中断整体逻辑
                     pass
 
         full_text = "\n".join(full_text_lines)
@@ -224,7 +200,7 @@ def call_llm(
 ) -> str:
     """
     通用 LLM 调用封装：
-    - 使用 Ark ChatCompletions
+    - 使用 火山引擎 Ark ChatCompletions
     - 默认返回 message.content 字符串
     """
     if not api_key:
@@ -248,7 +224,7 @@ def call_llm(
 
     try:
         session = requests.Session()
-        session.trust_env = False
+        session.trust_env = False  # 避免本地代理干扰
         resp = session.post(url, headers=headers, json=payload, timeout=timeout)
     except Exception as e:
         raise RuntimeError(f"调用 LLM 网络异常：{e}")
@@ -345,8 +321,8 @@ def extract_features(prd_text: str, guidelines: str, api_key: str, model_id: str
       "id": "F1",
       "name": "登录成功",
       "desc": "已注册用户输入正确的账号和密码登录系统并进入首页。",
-      "priority": "P0",         // P0/P1/P2
-      "module": "用户登录",      // 可复用 PRD 中的模块/页面名
+      "priority": "P0",
+      "module": "用户登录",
       "scene_type": "正向",
       "source_text": "从 PRD 中复制来的相关原文"
     }}
@@ -503,55 +479,45 @@ def generate_cases_for_feature(
     guidelines: str,
     api_key: str,
     model_id: str,
-
+    max_cases_per_feature: int,
 ) -> List[Dict[str, Any]]:
     """
     阶段二：针对单个功能点生成用例
-    - 引入企业测试规范（guidelines）
-    - 输出 JSON: {"cases":[...]}
-    - 所有字段值要求用简体中文
-    - test_data/post_actions 字段：用于后续自动化测试/清理
-    - 根据 scene_type 区分策略：
-      - 正向：主流程 + 异常 + 边界（如果有）
-      - 异常/约束/边界：聚焦异常和边界，不强行造无关正向
+    - 模型自行决定具体数量（至少 1 条），max_cases_per_feature 只是一个“软提示”
     """
     guideline_text = guidelines.strip() or "无"
     scene_type = feature.get("scene_type", "正向")
 
-    # 为了降低上下文长度，优先使用功能点自带的 source_text，并做截断
-    raw_context = feature.get("source_text") or prd_text
-    context_text = raw_context[:MAX_CONTEXT_CHARS]
-
-
-
+    # 为了降低上下文长度，优先使用功能点自带的 source_text
+    context_text = feature.get("source_text") or prd_text
 
     if scene_type == "异常":
         coverage_text = """
-    本功能点本身是异常类功能点（例如“未注册用户登录失败”）。
-    请围绕该异常场景设计合适数量的用例：
-    - 如果场景比较简单，可以只设计 1~2 条典型用例；
-    - 如果存在多种错误类型、不同用户状态或明显边界情况，可以适当多写几条（例如 3~5 条）；
-    - 至少要保证有 1 条能代表该异常场景的用例。
-    不需要为该功能点额外生成“用户名密码均正确时登录成功”之类的正向用例。
-    """
+本功能点本身是异常类功能点（例如“未注册用户登录失败”）。
+请围绕该异常场景设计合适数量的用例：
+- 如果场景比较简单，可以只设计 1~2 条典型用例；
+- 如果存在多种错误类型、不同用户状态或明显边界情况，可以适当多写几条（例如 3~5 条）；
+- 至少要保证有 1 条能代表该异常场景的用例。
+不需要为该功能点额外生成“用户名密码均正确时登录成功”之类的正向用例。
+"""
     elif scene_type in ("约束", "边界"):
         coverage_text = """
-    本功能点属于约束/边界类功能点（例如“用户名长度必须在 1~20 位以内”）。
-    请围绕该约束/边界设计合适数量的用例：
-    - 至少 1 条用例体现边界内合法值的成功场景（例如长度刚好等于最小/最大值时操作成功）；
-    - 可以根据复杂度，增加 1~3 条超出边界的失败场景（例如长度为 0 或大于最大限制时操作失败）；
-    - 若某个场景同时是边界又是异常，只需写一条用例，并优先将 type 标记为“边界”，不要为同一场景重复生成两条。
-    """
+本功能点属于约束/边界类功能点（例如“用户名长度必须在 1~20 位以内”）。
+请围绕该约束/边界设计合适数量的用例：
+- 至少 1 条用例体现边界内合法值的成功场景（例如长度刚好等于最小/最大值时操作成功）；
+- 可以根据复杂度，增加 1~3 条超出边界的失败场景（例如长度为 0 或大于最大限制时操作失败）；
+- 若某个场景同时是边界又是异常，只需写一条用例，并优先将 type 标记为“边界”，不要为同一场景重复生成两条。
+"""
     else:
         coverage_text = f"""
-    本功能点属于正常业务主流程功能点（scene_type="{scene_type}"）。
-    请围绕该功能点设计合适数量的用例：
-    - 至少 1 条核心正向流程用例（例如：输入合法参数后操作成功）；
-    - 可以根据功能复杂度，增加若干典型异常场景（如必填项为空、格式错误、权限不足等）；
-    - 如有明显边界值（长度/范围），建议至少包含 1 条边界用例；
-    - 如规范中提到安全/界面要求，可增加对应 type 为“安全”或“界面”的用例。
-    如果某个场景同时既是异常又是边界（例如“长度超过最大值时校验失败”），请只写一条用例，并优先将 type 标记为“边界”，不要为同一场景重复生成两条。
-    """
+本功能点属于正常业务主流程功能点（scene_type="{scene_type}"）。
+请围绕该功能点设计合适数量的用例：
+- 至少 1 条核心正向流程用例（例如：输入合法参数后操作成功）；
+- 可以根据功能复杂度，增加若干典型异常场景（如必填项为空、格式错误、权限不足等）；
+- 如有明显边界值（长度/范围），建议至少包含 1 条边界用例；
+- 如规范中提到安全/界面要求，可增加对应 type 为“安全”或“界面”的用例。
+如果某个场景同时既是异常又是边界（例如“长度超过最大值时校验失败”），请只写一条用例，并优先将 type 标记为“边界”，不要为同一场景重复生成两条。
+"""
 
     prompt = f"""
 你是一名资深测试工程师，请针对一个具体功能点设计测试用例。
@@ -576,6 +542,10 @@ def generate_cases_for_feature(
 【用例设计策略】（请严格遵守）
 {coverage_text}
 
+【数量提示（非硬性限制）】
+- 参考上限：不超过 {max_cases_per_feature} 条。
+- 实际生成条数请根据功能复杂度自行判断，只要覆盖充分、避免明显重复即可。
+
 【输出格式】
 只输出 JSON 对象，格式如下：
 {{
@@ -593,7 +563,7 @@ def generate_cases_for_feature(
         "预期结果1（中文）",
         "预期结果2（中文）"
       ],
-      "type": "正向",        // 例如：正向 / 异常 / 边界 / 安全 / 性能 / 界面 / 其他
+      "type": "正向",
       "test_data": "测试数据描述或 JSON 字符串",
       "post_actions": "清理/回滚操作描述（可为空字符串）"
     }}
@@ -637,54 +607,12 @@ def normalize_title_for_dedup(title: str) -> str:
 
 def semantic_dedup_cases(cases: List[Dict[str, Any]], sim_threshold: float = 0.85) -> List[Dict[str, Any]]:
     """
-    语义去重：
-    - 同一 module 内，如果两条用例的 (title+steps) 余弦相似度 > sim_threshold，则认为场景重复
-    - 保留描述更详细（steps+expected 更长）的那一条
+    语义去重（当前为占位实现）：
+    - 之前版本依赖 Embedding 计算相似度，现在已移除向量模型。
+    - 如果后续需要再加“语义去重”，可以在此处接入向量服务。
+    - 当前行为：直接返回原始列表，不做额外处理。
     """
-    if not HAS_EMBED or EMBED_MODEL is None:
-        return cases
-
-    texts = [
-        (idx, c.get("module", ""), (c.get("title", "") or "") + " " + (c.get("steps", "") or ""))
-        for idx, c in enumerate(cases)
-    ]
-    if not texts:
-        return cases
-
-    indices, modules, contents = zip(*texts)  # type: ignore
-    try:
-        emb = EMBED_MODEL.encode(list(contents), convert_to_numpy=True)
-    except Exception:
-        return cases
-
-    n = len(cases)
-    keep = [True] * n
-
-    for i in range(n):
-        if not keep[i]:
-            continue
-        for j in range(i + 1, n):
-            if not keep[j]:
-                continue
-            if modules[i] != modules[j]:
-                continue
-            va = emb[i]
-            vb = emb[j]
-            denom = (np.linalg.norm(va) + 1e-8) * (np.linalg.norm(vb) + 1e-8)
-            sim = float(np.dot(va, vb) / denom)
-            if sim >= sim_threshold:
-                # 比较 steps+expected 长度，保留更详细的那条
-                ci = cases[i]
-                cj = cases[j]
-                len_i = len(ci.get("steps", "")) + len(ci.get("expected", ""))
-                len_j = len(cj.get("steps", "")) + len(cj.get("expected", ""))
-                if len_i >= len_j:
-                    keep[j] = False
-                else:
-                    keep[i] = False
-                    break
-
-    return [c for idx, c in enumerate(cases) if keep[idx]]
+    return cases
 
 
 def generate_test_cases_pipeline(
@@ -692,16 +620,14 @@ def generate_test_cases_pipeline(
     guidelines: str,
     api_key: str,
     model_id: str,
-    progress_callback: Optional[Callable[[int, int], None]] = None,  # 新增，用于更新进度条
-    enable_semantic_dedup: bool = False,  # 新增：是否开启语义去重
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    enable_semantic_dedup: bool = False,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-
     """
-    整体生成流程（分治版）：
+    精细模式整体流程（分治 + 并发）：
     1. 抽取功能点 features
-    2. 针对每个功能点，让模型自行判断需要多少条用例（至少 1 条）
-    3. 按功能点逐个生成用例
-    4. 去重（合并异常 + 边界重复）
+    2. 并发针对每个功能点生成用例（模型自行决定条数，至少 1）
+    3. 去重（同模块 + 归一化标题；可选语义去重）
     """
     features = extract_features(prd_text, guidelines, api_key, model_id)
     if not features:
@@ -710,8 +636,7 @@ def generate_test_cases_pipeline(
     all_cases: List[Dict[str, Any]] = []
     total = len(features)
 
-    # ✅ 使用线程池并发为每个功能点生成用例
-    # 可根据自己接口限流情况调整 max_workers
+    # 使用线程池并发为每个功能点生成用例
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, total)) as executor:
         future_to_feature = {
             executor.submit(
@@ -721,7 +646,7 @@ def generate_test_cases_pipeline(
                 guidelines,
                 api_key,
                 model_id,
-
+                8,  # 只是 Prompt 提示用的上限，不会硬卡
             ): f
             for f in features
         }
@@ -739,7 +664,7 @@ def generate_test_cases_pipeline(
                 if progress_callback is not None:
                     progress_callback(done, total)
 
-    # 🔁 先做一次简单的“模块 + 归一化标题”去重
+    # 先做一次简单的“模块 + 归一化标题”去重
     seen = {}
     dedup_cases: List[Dict[str, Any]] = []
 
@@ -752,7 +677,6 @@ def generate_test_cases_pipeline(
             old_idx = seen[key]
             old_type = dedup_cases[old_idx]["type"]
             new_type = c.get("type", old_type)
-            # 如果旧的是“异常”，新的是“边界”，我们用边界覆盖异常
             if old_type == "异常" and new_type == "边界":
                 dedup_cases[old_idx]["type"] = "边界"
             continue
@@ -760,13 +684,11 @@ def generate_test_cases_pipeline(
         seen[key] = len(dedup_cases)
         dedup_cases.append(c)
 
-    # ⭐ 第二层：可选的语义相似去重（Embedding）
-    if enable_semantic_dedup and HAS_EMBED and EMBED_MODEL is not None:
+    # 可选：再做一层语义去重（目前占位，实际不做事）
+    if enable_semantic_dedup:
         dedup_cases = semantic_dedup_cases(dedup_cases, sim_threshold=0.85)
 
     return features, dedup_cases
-
-
 
 
 # ================== 快速模式：单轮生成 ==================
@@ -777,13 +699,14 @@ def generate_test_cases_quick(
     guidelines: str,
     api_key: str,
     model_id: str,
-    max_cases: int = 50,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     快速模式：一次性调用大模型生成测试用例，不做功能点拆解。
-    返回值形式与 pipeline 一致： (features, cases)
-    features 这里先返回空列表 []。
+    - 不让用户指定用例条数，让模型根据 PRD 复杂度自动决定。
+    - 内部有一个安全兜底上限，防止模型异常生成过多用例。
+    返回值形式与 pipeline 一致： (features, cases)，features 这里返回空列表 []。
     """
+
     guideline_text = guidelines.strip() or "无"
 
     prompt = f"""
@@ -804,16 +727,21 @@ def generate_test_cases_quick(
 {guideline_text}
 
 【任务要求】
-- 直接根据整个 PRD 设计测试用例，数量控制在不超过 {max_cases} 条。
-- 覆盖：主要正向流程、典型异常场景、重要边界场景和关键安全/界面要求（如果规范中有提到）。
-- 每条用例只测试一个清晰的场景。
+- 请根据 PRD 的复杂度，自动判断需要多少条测试用例：
+  - 如果需求比较简单，可以生成大约 5~15 条用例；
+  - 如果需求包含多个模块或复杂流程，可以生成更多用例，但要避免明显重复。
+- 用例需要尽量覆盖：
+  - 主要正向流程
+  - 典型异常场景
+  - 重要边界场景
+  - 关键安全/界面要求（如果规范中有提到）。
+- 每条用例只测试一个清晰的场景，不要在一条用例中混合多个不相关场景。
 
 【输出格式】
 只输出 JSON 对象，格式如下：
 {{
   "cases": [
     {{
-
       "id": "TC-001",
       "module": "模块名称（中文）",
       "title": "用例标题（中文）",
@@ -846,6 +774,11 @@ def generate_test_cases_quick(
     obj = clean_and_parse_json(raw)
     cases = normalize_cases(obj)
 
+    # 安全兜底：防止模型一次性吐出几百上千条
+    MAX_AUTO_CASES = 120
+    if len(cases) > MAX_AUTO_CASES:
+        cases = cases[:MAX_AUTO_CASES]
+
     return [], cases
 
 
@@ -853,7 +786,7 @@ def generate_test_cases_quick(
 
 
 def compute_basic_metrics(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """格式合规率 + 冗余度 + 模糊词数量"""
+    """结构合规率 + 冗余度 + 模糊词数量等基础指标"""
     total = len(cases)
     if total == 0:
         return {
@@ -911,91 +844,106 @@ def jaccard_similarity(a: str, b: str) -> float:
     return inter / union if union else 0.0
 
 
-def embedding_title_similarity(ai_cases: List[Dict[str, Any]], human_titles: List[str]) -> float:
+def evaluate_against_human_by_llm(
+    api_key: str,
+    model_id: str,
+    ai_cases: List[Dict[str, Any]],
+    human_df: pd.DataFrame,
+) -> Dict[str, Any]:
     """
-    语义相似度（可选）：基于 SentenceTransformer 的标题向量相似度
-    - 对每条人工标题，在 AI 标题中找到最高 cosine，相加取平均
-    """
-    if not HAS_EMBED or EMBED_MODEL is None:
-        raise RuntimeError("当前环境未安装 sentence-transformers 或模型加载失败。")
-
-    ai_titles = [c.get("title", "") for c in ai_cases if c.get("title")]
-    if not ai_titles or not human_titles:
-        return 0.0
-
-    ai_emb = EMBED_MODEL.encode(ai_titles, convert_to_numpy=True)
-    human_emb = EMBED_MODEL.encode(human_titles, convert_to_numpy=True)
-
-    sims = []
-    for h in human_emb:
-        denom = np.linalg.norm(ai_emb, axis=1) * (np.linalg.norm(h) + 1e-8)
-        scores = np.dot(ai_emb, h) / (denom + 1e-8)
-        sims.append(float(scores.max()))
-    return float(np.mean(sims)) if sims else 0.0
-
-
-def evaluate_against_human_csv(ai_cases: List[Dict[str, Any]], human_df: pd.DataFrame) -> Dict[str, float]:
-    """
-    CSV/Excel 人工用例对比：
-    - 必须有 'title' 列
-    - 返回：{"jaccard":..., "semantic":..., "recall":..., "precision":..., "f1":...}
+    使用 LLM 对比“AI 用例”与“人工用例”：
+    - 不再做向量相似度，而是直接让 LLM 像测试经理一样判断覆盖率/精确率/F1。
+    - 返回：
+      {
+        "coverage_score": 85.0,
+        "precision_score": 78.0,
+        "f1_score": 81.2,
+        "comments": "文字点评"
+      }
     """
     if "title" not in human_df.columns:
         raise RuntimeError("人工用例 CSV/Excel 中必须包含列名为 'title' 的列")
 
-    human_titles = [str(t) for t in human_df["title"].tolist() if str(t).strip()]
+    human_titles = [
+        str(t).strip()
+        for t in human_df["title"].tolist()
+        if str(t).strip()
+    ]
     if not human_titles:
-        return {"jaccard": 0.0, "semantic": 0.0, "recall": 0.0, "precision": 0.0, "f1": 0.0}
+        return {
+            "coverage_score": 0.0,
+            "precision_score": 0.0,
+            "f1_score": 0.0,
+            "comments": "人工用例的标题列为空，无法进行对比评估。",
+        }
 
-    ai_titles = [c.get("title", "") for c in ai_cases if c.get("title")]
-    ai_concat = "".join(ai_titles)
-    human_concat = "".join(human_titles)
-    jac = jaccard_similarity(ai_concat, human_concat) * 100
+    ai_short = [
+        {"id": c.get("id", ""), "module": c.get("module", ""), "title": c.get("title", "")}
+        for c in ai_cases
+        if c.get("title")
+    ]
+    if not ai_short:
+        return {
+            "coverage_score": 0.0,
+            "precision_score": 0.0,
+            "f1_score": 0.0,
+            "comments": "当前没有可用的 AI 用例标题，无法进行对比评估。",
+        }
 
-    sem = 0.0
-    recall = precision = f1 = 0.0
-    if HAS_EMBED and EMBED_MODEL is not None and ai_titles:
-        try:
-            ai_emb = EMBED_MODEL.encode(ai_titles, convert_to_numpy=True)
-            human_emb = EMBED_MODEL.encode(human_titles, convert_to_numpy=True)
+    prompt = f"""
+你是一名测试经理，现在需要对比“人工编写的测试用例”和“AI 生成的测试用例”，从需求覆盖的角度给出量化评估。
 
-            # 对每个人工 title，在 AI 中找最高相似度
-            hit_h = 0
-            for h_vec in human_emb:
-                denom = np.linalg.norm(ai_emb, axis=1) * (np.linalg.norm(h_vec) + 1e-8)
-                scores = np.dot(ai_emb, h_vec) / (denom + 1e-8)
-                if scores.max() >= 0.75:
-                    hit_h += 1
-            recall = hit_h / len(human_titles) if human_titles else 0.0
+【人工用例标题列表】
+（每一行代表一条人工用例的标题）
+{json.dumps(human_titles, ensure_ascii=False, indent=2)}
 
-            # 对每个 AI title，在人工中找最高相似度
-            hit_ai = 0
-            for a_vec in ai_emb:
-                denom = np.linalg.norm(human_emb, axis=1) * (np.linalg.norm(a_vec) + 1e-8)
-                scores = np.dot(human_emb, a_vec) / (denom + 1e-8)
-                if scores.max() >= 0.75:
-                    hit_ai += 1
-            precision = hit_ai / len(ai_titles) if ai_titles else 0.0
+【AI 生成的用例列表（只给出基础信息）】
+{json.dumps(ai_short, ensure_ascii=False, indent=2)}
 
-            if recall + precision > 0:
-                f1 = 2 * recall * precision / (recall + precision)
+【任务说明】
+- 你可以把“人工用例”视为基准答案，“AI 用例”视为候选答案。
+- 请基于语义理解，判断 AI 用例是否覆盖了人工用例中描述的场景，而不仅仅是字符串匹配。
+- “覆盖”的含义：
+  - 如果 AI 用例中有一条或多条用例，其标题所表达的测试场景与某个人工用例相同或高度相似，则视为覆盖；
+  - 如果人工用例中出现了一个重要场景，而 AI 用例完全没有体现，则视为未覆盖；
+  - AI 用例中多写了一些场景不扣分，但会影响“精确率”。
 
-            # 语义相似度：人工标题对 AI 标题的平均最高相似度
-            sims = []
-            for h_vec in human_emb:
-                denom = np.linalg.norm(ai_emb, axis=1) * (np.linalg.norm(h_vec) + 1e-8)
-                scores = np.dot(ai_emb, h_vec) / (denom + 1e-8)
-                sims.append(float(scores.max()))
-            sem = float(sum(sims) / len(sims)) if sims else 0.0
-        except Exception:
-            sem = 0.0
+【需要输出的指标】
+请你从测试指标的角度，给出以下量化指标（0~100 的百分数）：
+1. coverage_score：覆盖率（以人工用例为基准，至少被 AI 覆盖一次的比例）
+2. precision_score：精确率（以 AI 用例为基准，其中真正命中人工场景的比例）
+3. f1_score：F1 值（由覆盖率和精确率综合计算）
+4. comments：对这次对齐情况的简要文字点评（用中文）
+
+【输出格式】
+请只输出一个 JSON 对象，例如：
+{{
+  "coverage_score": 85.0,
+  "precision_score": 80.0,
+  "f1_score": 82.5,
+  "comments": "整体覆盖较好，但 AI 略少了一些边界场景。"
+}}
+""".strip()
+
+    messages = [
+        {"role": "system", "content": "你是一名资深测试经理，负责评估 AI 生成用例与人工用例的一致性。"},
+        {"role": "user", "content": prompt},
+    ]
+
+    raw = call_llm(
+        api_key=api_key,
+        model_id=model_id,
+        messages=messages,
+        response_format={"type": "json_object"},
+        timeout=300,
+    )
+    obj = clean_and_parse_json(raw)
 
     return {
-        "jaccard": jac,
-        "semantic": sem * 100,
-        "recall": recall * 100,
-        "precision": precision * 100,
-        "f1": f1 * 100,
+        "coverage_score": float(obj.get("coverage_score", 0.0)),
+        "precision_score": float(obj.get("precision_score", 0.0)),
+        "f1_score": float(obj.get("f1_score", 0.0)),
+        "comments": obj.get("comments", ""),
     }
 
 
@@ -1108,8 +1056,8 @@ def coverage_by_llm(
 【输出要求】
 只输出一个 JSON 对象，字段包括：
 {{
-  "coverage_score": 0.85,            // 覆盖率 = 1 - 未覆盖功能点数 / 功能点总数
-  "uncovered_features": ["F2","F5"], // 未覆盖的功能点 id 列表（如没有则为空数组）
+  "coverage_score": 0.85,
+  "uncovered_features": ["F2","F5"],
   "analysis": "对覆盖情况的简要分析和改进建议（中文）"
 }}
 """.strip()
@@ -1369,7 +1317,6 @@ with st.sidebar:
         key="judge_model_id",
     )
 
-
     st.divider()
     st.header("🏢 企业测试规范（RAG 思想）")
     test_guidelines = st.text_area(
@@ -1464,11 +1411,10 @@ with tab2:
                             guidelines=test_guidelines,
                             api_key=ark_api_key,
                             model_id=model_id,
-                            max_cases=50,
                         )
                         st.session_state["features"] = features
                         st.session_state["cases"] = cases
-                        st.success(f"✅ [快速模式] 已生成 {len(cases)} 条测试用例")
+                        st.success(f"✅ [快速模式] 已生成 {len(cases)} 条测试用例（数量由模型自行判断）")
                     except Exception as e:
                         st.error(f"生成过程出错：{e}")
             else:
@@ -1478,7 +1424,7 @@ with tab2:
 
                 def _progress_cb(done: int, total: int):
                     ratio = done / max(total, 1)
-                    progress_bar.progress(ratio)
+                    progress_bar.progress(min(ratio, 1.0))
                     status_text.text(f"已完成 {done}/{total} 个功能点的用例生成...")
 
                 with st.spinner("🤖 正在进行功能点拆解并并发生成测试用例..."):
@@ -1488,7 +1434,8 @@ with tab2:
                             guidelines=test_guidelines,
                             api_key=ark_api_key,
                             model_id=model_id,
-
+                            progress_callback=_progress_cb,
+                            enable_semantic_dedup=False,  # 如需开启占位语义去重可设 True
                         )
                         st.session_state["features"] = features
                         st.session_state["cases"] = cases
@@ -1556,7 +1503,6 @@ with tab2:
         excel_buffer = BytesIO()
         with pd.ExcelWriter(excel_buffer, engine="xlsxwriter") as writer:
             edited_df.to_excel(writer, index=False, sheet_name="TestCases")
-            # 可以在此处进一步设置单元格换行、列宽等
         excel_buffer.seek(0)
         st.download_button(
             "📥 导出 Excel (.xlsx)",
@@ -1637,6 +1583,8 @@ with tab3:
                 st.success("未检测到明显模糊词，用例描述较为严谨。")
 
             # 3. 统计+相似度雷达图
+            csv_result = None  # 用于存储 LLM 对齐评估结果
+
             if run_eval:
                 st.markdown("---")
                 st.subheader("3. 综合雷达图评估")
@@ -1647,30 +1595,35 @@ with tab3:
                     ai_concat = "".join(df_cases["title"].astype(str).tolist())
                     text_sim = jaccard_similarity(ai_concat, golden_text) * 100
 
-                # CSV/Excel 相似度（Jaccard + 语义 + F1）
-                csv_jac = csv_sem = csv_rec = csv_pre = csv_f1 = None
+                # 基于 LLM 的“人工用例对齐评估”
                 if uploaded_gold is not None:
-                    try:
-                        if uploaded_gold.name.endswith(".csv"):
-                            human_df = pd.read_csv(uploaded_gold)
-                        else:
-                            human_df = pd.read_excel(uploaded_gold)
-                        sim_dict = evaluate_against_human_csv(cases, human_df)
-                        csv_jac = sim_dict["jaccard"]
-                        csv_sem = sim_dict["semantic"]
-                        csv_rec = sim_dict["recall"]
-                        csv_pre = sim_dict["precision"]
-                        csv_f1 = sim_dict["f1"]
-                        st.info(
-                            f"基于 CSV/Excel 的标题相似度："
-                            f"Jaccard ≈ {csv_jac:.1f}%，"
-                            f"语义相似度 ≈ {csv_sem:.1f}%，"
-                            f"召回率 ≈ {csv_rec:.1f}%，"
-                            f"精确率 ≈ {csv_pre:.1f}%，"
-                            f"F1 ≈ {csv_f1:.1f}%。"
-                        )
-                    except Exception as e:
-                        st.error(f"解析人工用例文件失败：{e}")
+                    if not ark_api_key:
+                        st.error("使用 LLM 评估前，请先在侧边栏配置 API Key")
+                    elif not judge_model_id:
+                        st.error("请在侧边栏配置评审模型 ID")
+                    else:
+                        try:
+                            if uploaded_gold.name.endswith(".csv"):
+                                human_df = pd.read_csv(uploaded_gold, encoding="utf-8", errors="ignore")
+                            else:
+                                human_df = pd.read_excel(uploaded_gold)
+
+                            csv_result = evaluate_against_human_by_llm(
+                                api_key=ark_api_key,
+                                model_id=judge_model_id,
+                                ai_cases=cases,
+                                human_df=human_df,
+                            )
+                            st.info(
+                                f"基于人工用例的 LLM 评估："
+                                f"覆盖率 ≈ {csv_result['coverage_score']:.1f}%，"
+                                f"精确率 ≈ {csv_result['precision_score']:.1f}%，"
+                                f"F1 ≈ {csv_result['f1_score']:.1f}%。"
+                            )
+                            if csv_result.get("comments"):
+                                st.caption("LLM 对齐点评：" + csv_result["comments"])
+                        except Exception as e:
+                            st.error(f"解析或评估人工用例失败：{e}")
 
                 # 类型丰富度评分
                 if "type" in df_cases.columns:
@@ -1691,13 +1644,17 @@ with tab3:
                 extra_types = {"边界", "安全", "性能", "界面"}
                 extra_count = len(types_set & extra_types)
                 extra_bonus = min(15.0, extra_count * 5.0)
-
                 balance_score = min(100.0, base_score + extra_bonus)
 
                 format_score = metrics["format_rate"] * 100
                 redundancy_score = (1 - metrics["redundancy"]) * 100
                 rigor_score_final = rigor_score
-                sim_score = csv_f1 if (csv_f1 is not None) else (text_sim if golden_text.strip() else 0.0)
+
+                # 如果有 LLM F1，就用它；否则退回到文本 Jaccard
+                if csv_result is not None:
+                    sim_score = csv_result["f1_score"]
+                else:
+                    sim_score = text_sim
 
                 categories = ["场景类型丰富度", "格式规范性", "冗余控制", "描述严谨度", "对人工基准的接近度(F1)"]
                 scores = [
@@ -1770,7 +1727,9 @@ with tab3:
             if coverage_result:
                 st.markdown("---")
                 st.subheader("5. 功能点覆盖率（LLM 检查版本）")
-                cov_score = coverage_result.get("coverage_score", 0) * 100 if coverage_result.get("coverage_score", 0) <= 1.0 else coverage_result.get("coverage_score", 0)
+                cov_score_raw = coverage_result.get("coverage_score", 0)
+                # 兼容 0~1 或 0~100 两种写法
+                cov_score = cov_score_raw * 100 if cov_score_raw <= 1.0 else cov_score_raw
                 st.metric("功能点覆盖率", f"{cov_score:.1f}%")
                 uncovered = coverage_result.get("uncovered_features", [])
                 if uncovered:
